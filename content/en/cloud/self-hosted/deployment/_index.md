@@ -22,70 +22,175 @@ Layer5 offers on-premises installation of its [Meshery Remote Provider](https://
 
 #### Prerequisites
 
-##### 1. Prepare a Persistent Volume
+Before you begin ensure the following are installed:
+- Helm.
+- An ingress controller like `ingress-nginx`.
+- A certificate manager like `cert-manager`.
 
-A persistent volume to store the Postgres database is necessary to prepare prior to deployment. If your target cluster does not have a persistent volume readily available (or not configured for automatic PV provisioning and binding of PVCs to PV), we suggest to apply the following configuration to your cluster.
+##### 1. Create dedicated namespaces
 
+This deployment uses two namespaces, `cnpg-postgres` for hosting the PostgreSQL database using CloudNativePG operator and `layer5-cloud` namespace for the Layer5 cloud. You can also choose to keep all components in the same namespace. 
 ```bash
-kubectl apply -f install/kubernetes/persistent-volume.yaml
+kubectl create ns cnpg-postgres
+kubectl create ns layer5-cloud
 ```
 
-##### 2. Prepare a dedicated namespace and add the chart repo to your helm configuration
+##### 2. Prepare for data persistence (Persistent Volume)
 
-*You may choose to use an alternative namespace, but the following instructions assume the use of `layer5` namespace.*
+Layer5 uses PostgreSQL database that requires a persistent storage. It can be configured in many different ways in a Kubernetes cluster. Here we are using _local path provisioner from Rancher_ which automatically creates a PV using a set local path. Running the follwing command to deploy the local path provisioner: 
 
 ```bash
-kubectl create ns layer5
-helm repo add layer5 https://docs.layer5.io/charts
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.31/deploy/local-path-storage.yaml
 ```
 
-##### 3. Ensure NGINX Ingress Controller is deployed
+This creates a default storage class called `local-path` which stores data by default in `/opt/local-path-provisioner` and has the reclaim policy set to `Delete`. 
 
-*You may chose to use an alternative ingress controller, but the following instructions assume the use of NGINX Ingress Controller.*
+> **_NOTE:_** It is recommended you create a new storage class that uses a different path with ample storage and uses `Retain` reclaim policy. 
+
+For this guide, we will use the defaults.
+
+##### 3. Install an ingress controller
+
+This example deployment uses ingress-nginx but you may choose to use an ingress controller of your choice.
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/cloud/deploy.yaml
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.13.3/deploy/static/provider/cloud/deploy.yaml
 ```
 
 #### Installation
 
-The first service to install is the Postgres database. The following command installs the Postgres database and initializes it's dataset. The dataset is used by the Layer5 Cloud server and the Layer5 Cloud identity provider.
+You will install the Postgres database first followed by Layer5 cloud.
 
-Layer5 Cloud `postgres` database requires [pg_cron](https://github.com/citusdata/pg_cron) extension to be enabled and configured to execute on a schedule. The Cloud instance is bundled with both Data Definition Language (DDL) to iniatilze the schema and with Data Manipulation Language (DML) that support both greenfield deployments and upgrades of existing deployments.
+##### 1. Deploy PostgreSQL using CloudNativePG
 
-##### 1. Install Postgres database
+In this example, we are using CloudNativePG's operator based approach to create a PostgreSQL cluster. You can choose a different approach of your choice.
 
-```bash
-helm repo add bitnami https://charts.bitnami.com/bitnami
-helm install postgresql bitnami/postgresql --version 14.0.1
-```
-
-##### 2. Install Remote Provider Server and Identity Provider
+PostgreSQL requires persistent storage which can be configured in many different ways in a Kubernetes cluster. Here we are using _local path provisioner from Rancher_ which automatically creates a PV using a set local path. Running the follwing command to deploy the local path provisioner: 
 
 ```bash
-## TBD: Delete local filesystem reference
-# helm install -f ./install/kubernetes/values.yaml cloud ./install/kubernetes -n <namespace>`
-
-helm install -f ./install/helm-chart-values/layer5-cloud-values.yaml cloud ./install/kubernetes -n postgres \
---set-file 'kratos.kratos.emailTemplates.recovery.valid.subject'=<path to the email templates to override>/valid/email-recover-subject.body.gotmpl \
---set-file 'kratos.kratos.emailTemplates.recovery.valid.body'=<path to the email templates to override>/valid/email-recover.body.gotmpl \
---set-file 'kratos.kratos.emailTemplates.verification.valid.subject'=<path to the email templates to override>/valid/email-verify-subject.body.gotmpl \
---set-file 'kratos.kratos.emailTemplates.verification.valid.body'=<path to the email templates to override>/valid/email-verify.body.gotmpl
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.31/deploy/local-path-storage.yaml
 ```
 
-##### 3. Create an OAuth 2.0 client
-1. Port forward the Hydra Admin service.
-2. ```bash
-    hydra clients create \
-    --endpoint <port forwarded endpoint> \
-    --id meshery-cloud \ <--- ensure the id specified matches with the env.oauthclientid in values.yaml
-    --secret some-secret \ <--- ensure the secret specified matches with the env.oauthsecret in values.yaml
-    --grant-types authorization_code,refresh_token,client_credentials,implicit \
-    --response-types token,code,id_token \
-    --scope openid,offline,offline_access \
-    --callbacks <Layer5 Cloud host>/callback 
+This creates a default storage class called `local-path` which stores data by default in `/opt/local-path-provisioner`. You can create a new storage class that uses a different path. For this deployment, we will use the defaults.
+
+Add and install CloudNativePG operator using the following commands:
+
+```bash
+helm repo add cnpg https://cloudnative-pg.github.io/charts
+
+helm upgrade --install cnpg --namespace cnpg-system --create-namespace cnpg/cloudnative-pg
+```
+
+Deploying a PostgreSQL cluster requires the follwing pre-requisite resources:
+- A super user secret
+- A Meshery user secret
+
+Run the following commands to create them replacing username and passwords as needed:
+```bash
+kubectl -n cnpg-postgres create secret generic meshery-user --from-literal=username=meshery --from-literal=password=meshery --type=kubernetes.io/basic-auth
+```
+
+```bash
+kubectl -n cnpg-postgres create secret generic cnpg-superuser --from-literal=username=postgres --from-literal=password=postgres --type=kubernetes.io/basic-auth
+```
+
+For this documentation, we use the following manifests to deploy a PostgreSQL cluster:
+```yaml
+# cluster.yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: cnpg-postgres
+  namespace: cnpg-postgres
+spec:
+  instances: 2
+  # Persistent storage configuration
+  storage:
+    storageClass: local-path
+    size: 10Gi
+
+  superuserSecret:
+    name: cnpg-superuser
+  bootstrap:
+    initdb:
+      database: meshery
+      owner: meshery
+      secret:
+        name: meshery-user
+      postInitSQL:
+        - create database hydra owner meshery;
+        - create database kratos owner meshery;
+        - create extension "uuid-ossp";
+        - ALTER ROLE meshery WITH SUPERUSER;
+      postInitApplicationSQLRefs:
+        configMapRefs:
+          - name: extra-init
+            key: init.sql
+---
+# extra-init.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: extra-init
+  namespace: cnpg-postgres
+data:
+  init.sql: |
+    GRANT ALL PRIVILEGES ON DATABASE meshery to meshery;
+    GRANT ALL PRIVILEGES ON DATABASE hydra to meshery;
+    GRANT ALL PRIVILEGES ON DATABASE kratos to meshery;
+```
+
+CloudNativePG provides a curated list of [samples](https://github.com/cloudnative-pg/cloudnative-pg/blob/main/docs/src/samples.md) showing configuration options that can be used as a reference.
+
+Apply the YAML file. You should notice two cnpg pods shortly thereafter.
+```bash
+NAME     READY   STATUS    RESTARTS   AGE
+cnpg-postgres-1   1/1     Running   0          3h5m
+cnpg-postgres-2   1/1     Running   0          3h5m
+```
+Retrieve the _Service_ endpoints of cnpg. This must be updated in the Layer5 `values.yaml` file later.
+
+##### 2. Deploy Layer5 cloud
+
+1. Start by adding the Layer5 helm chart repo.
+    ```bash
+    helm repo add layer5 https://docs.layer5.io/charts
     ```
 
-## Uninstalling the Chart
+2. Next, to modify values such as the database connection or other parameters, you will use the `values.yaml` file. 
+
+    You can generate it using the following command:
+    ```bash
+    helm show values layer5/layer5-cloud > values.yaml
+    ```
+    Review and update values if necessary. If you have followed this tutorial with the exact steps, there are no changes requires to get started.
+
+3. Deploy Layer5 cloud using the `helm install` command.
+
+    ```bash
+    helm install -f values.yaml layer5-cloud -n layer5-cloud
+    ```
+
+##### 3. Create an OAuth 2.0 client
+1. Port forward the _Hydra Admin_ service.
+
+2. Run the following command to create the hydra client:
+```bash
+hydra clients create \
+--endpoint <port forwarded endpoint> \
+--id meshery-cloud \ <--- ensure the id specified matches with the env.oauthclientid in values.yaml
+--secret some-secret \ <--- ensure the secret specified matches with the env.oauthsecret in values.yaml
+--grant-types authorization_code,refresh_token,client_credentials,implicit \
+--response-types token,code,id_token \
+--scope openid,offline,offline_access \
+--callbacks <Layer5 Cloud host>/callback 
+```
+
+### Uninstalling the Chart
+
+To uninstall run the following command:
+```bash
+helm uninstall layer5-cloud -n layer5-cloud
+```
 
     
